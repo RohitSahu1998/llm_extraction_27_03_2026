@@ -1,0 +1,21 @@
+# Web Application UI
+streamlit>=1.30.0
+
+# Vision-Language Model (Qwen)
+torch>=2.1.0
+transformers>=4.40.0
+accelerate>=0.28.0
+
+# Optical Character Recognition (PaddleOCR)
+paddleocr>=2.7.0.0
+# NOTE: If you don't have an Nvidia GPU installed, change the line below to simply "paddlepaddle"
+paddlepaddle-gpu>=2.6.0
+
+# Document & Image Processing
+opencv-python>=4.8.0
+pdf2image>=1.16.3
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Data Manipulation
+pandas>=2.0.0
