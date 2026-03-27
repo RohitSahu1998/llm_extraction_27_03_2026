@@ -45,7 +45,26 @@ def filter_spatial_outliers(boxes):
     return filtered if filtered else boxes
 
 def extract_qwen_items(data, path=""):
+    """
+    Recursively extracts all semantic items. 
+    Now explicitly handles BOTH the old string format {"field": "value"} 
+    AND the new Grounded Box format {"field": {"value": "text", "bbox": [...]}}
+    """
     results = []
+    
+    # Check if this item is the new dictionary format with a nested "value" and "bbox"
+    if isinstance(data, dict) and "value" in data and "bbox" in data:
+        val = str(data["value"]).strip()
+        if val and val.lower() not in ["none", "-", "null", ""]:
+            results.append({
+                "field": path, 
+                "value": val, 
+                "clean": clean_alphanumeric(val), 
+                "claimed_boxes": [],
+                "qwen_bbox": data["bbox"] # Saves Qwen's coordinates in case we want them!
+            })
+        return results
+
     if isinstance(data, dict):
         for k, v in data.items():
             new_path = f"{path}.{k}" if path else k
@@ -57,38 +76,39 @@ def extract_qwen_items(data, path=""):
     else:
         val = str(data).strip()
         if val and val.lower() not in ["none", "-", "null", ""]:
-            results.append({"field": path, "value": val, "clean": clean_alphanumeric(val), "claimed_boxes": []})
+            results.append({
+                "field": path, 
+                "value": val, 
+                "clean": clean_alphanumeric(val), 
+                "claimed_boxes": [],
+                "qwen_bbox": None
+            })
     return results
 
 def get_match_weight(ocr_text, qwen_text):
-    """
-    Returns (True/False, Weight).
-    Higher weight wins! This prevents "30 LYRICA" from stealing "30".
-    """
     ocr_clean = clean_alphanumeric(ocr_text)
     q_clean = clean_alphanumeric(qwen_text)
     
     if not ocr_clean or not q_clean: return False, 0
-    if ocr_clean == q_clean: return True, 4 # 🏆 EXACT MATCH wins over everything
+    if ocr_clean == q_clean: return True, 4 
     
     ocr_words = str(ocr_text).split()
     for w in ocr_words:
         w_clean = clean_alphanumeric(w)
         if w_clean and w_clean == q_clean: 
-            return True, 3 # 🏅 EXACT TOKEN MATCH (OCR line contains exact Qwen word)
+            return True, 3 
             
-    if ocr_clean in q_clean and len(ocr_clean) >= 2: return True, 2 # Substring 
-    if q_clean in ocr_clean and len(q_clean) >= 3: return True, 2 # Substring
+    if ocr_clean in q_clean and len(ocr_clean) >= 2: return True, 2  
+    if q_clean in ocr_clean and len(q_clean) >= 3: return True, 2 
     
     for w in ocr_words:
         w_clean = clean_alphanumeric(w)
         if w_clean and len(w_clean) >= 3 and w_clean in q_clean:
             return True, 1
             
-    # Fuzzy matching for dates/typos (e.g. 08072025 vs 080725)
     if len(q_clean) >= 5 and len(ocr_clean) >= 4:
         ratio = difflib.SequenceMatcher(None, ocr_clean, q_clean).ratio()
-        if ratio > 0.75: # ~80% similarity catches date formats perfectly
+        if ratio > 0.75: 
             return True, 0.5 
             
     return False, 0
@@ -101,19 +121,16 @@ def match_single_page(qwen_page_dict, ocr_page_list):
         box['candidates_raw'] = []
         box['candidates'] = []
         
-    # 2. Find Candidates with weights
     for box in ocr_page_list:
         for q in qwen_items:
             matched, weight = get_match_weight(box.get('text', ''), q['value'])
             if matched:
                 box['candidates_raw'].append((q, weight))
                 
-        # ONLY KEEP THE TOP WEIGHT CANDIDATES (Prevents substring "hoovering")
         if box['candidates_raw']:
             max_w = max(c[1] for c in box['candidates_raw'])
             box['candidates'] = [c[0] for c in box['candidates_raw'] if c[1] == max_w]
                 
-    # 3. Anchor Unambiguous Boxes
     for box in ocr_page_list:
         if len(box['candidates']) == 1:
             q = box['candidates'][0]
@@ -122,11 +139,8 @@ def match_single_page(qwen_page_dict, ocr_page_list):
         else:
             box['assigned'] = None
             
-    # 4. Resolve Ambiguous Boxes Spatially
     for box in ocr_page_list:
         if len(box['candidates']) > 1 and box['assigned'] is None:
-            # Hungry Round-Robin: If multiple exact matches exist (e.g. two $2,976.35),
-            # only allow fields that haven't claimed one yet to bid!
             hungry_candidates = [q for q in box['candidates'] if not q['claimed_boxes']]
             search_pool = hungry_candidates if hungry_candidates else box['candidates']
             
@@ -147,7 +161,6 @@ def match_single_page(qwen_page_dict, ocr_page_list):
             best_q['claimed_boxes'].append(box)
             box['assigned'] = best_q
             
-    # 5. Compile Final Bounding Boxes
     final_output = []
     for q in qwen_items:
         if q['claimed_boxes']:
@@ -158,24 +171,32 @@ def match_single_page(qwen_page_dict, ocr_page_list):
                 "field": q['field'],
                 "qwen_value": q['value'],
                 "bbox": final_bbox,
-                "matched_ocr_text": " | ".join([b['text'] for b in sane_boxes])
+                "matched_ocr_text": " | ".join([b['text'] for b in sane_boxes]),
+                "qwen_native_bbox": q["qwen_bbox"] # Passthrough Native Box if it exists
             })
         else:
-            final_output.append({"field": q['field'], "qwen_value": q['value'], "bbox": None, "matched_ocr_text": None})
+            final_output.append({
+                "field": q['field'], 
+                "qwen_value": q['value'], 
+                "bbox": None, 
+                "matched_ocr_text": None,
+                "qwen_native_bbox": q["qwen_bbox"]
+            })
             
     return final_output
 
 def export_to_csv(all_matched_results, output_csv_path="matched_data.csv"):
     with open(output_csv_path, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["Page", "Field", "Qwen_Value", "OCR_Matched_Text", "Bounding_Box"])
+        writer.writerow(["Page", "Field", "Qwen_Value", "OCR_Matched_Text", "OCR_Bounding_Box", "Qwen_Native_Bounding_Box"])
         for res in all_matched_results:
             writer.writerow([
                 res.get('page', 'Unknown'),
                 res['field'],
                 res['qwen_value'],
                 res['matched_ocr_text'] if res['matched_ocr_text'] else "NO MATCH",
-                str(res['bbox']) if res['bbox'] else "None"
+                str(res['bbox']) if res['bbox'] else "None",
+                str(res['qwen_native_bbox']) if res['qwen_native_bbox'] else "None"
             ])
 
 def highlight_and_save_pdf(input_document_path, qwen_full_data, ocr_full_data, output_pdf_path="highlighted_output.pdf"):
@@ -192,7 +213,7 @@ def highlight_and_save_pdf(input_document_path, qwen_full_data, ocr_full_data, o
         page_num = page_index + 1
         print(f"\n--- Processing Page {page_num} ---")
         
-        qwen_page_dict = qwen_full_data.get(f"page_{page_num}", qwen_full_data) # Fallback if not paginated
+        qwen_page_dict = qwen_full_data.get(f"page_{page_num}", qwen_full_data) 
         ocr_page_list = [box for box in ocr_full_data if box.get('page') == page_num]
         
         if not ocr_page_list: ocr_page_list = ocr_full_data 
@@ -211,15 +232,17 @@ def highlight_and_save_pdf(input_document_path, qwen_full_data, ocr_full_data, o
             if res['bbox']:
                 x1, y1 = int(res['bbox'][0][0]), int(res['bbox'][0][1])
                 x2, y2 = int(res['bbox'][2][0]), int(res['bbox'][2][1])
-                # Green bounding box tightly around the VALUE
+                
+                # --- HIGHLIGHTING LOGIC ---
+                # Draw the green box tightly around the VALUE
                 cv2.rectangle(cv_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 
-                # The label above it will be the KEY (e.g. 'cpt_codes') in RED text
+                # Get the Key/Field name
                 label = f"{res['field']}"
                 (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 yd = max(20, y1)
                 
-                # Draw a clean white background for the label so the red text is easy to read
+                # Draw a White Background Box just for the label
                 cv2.rectangle(cv_img, (x1, yd - 20), (x1 + w, yd), (255, 255, 255), -1)
                 
                 # Draw the Key text in RED (BGR format is Blue=0, Green=0, Red=255)
