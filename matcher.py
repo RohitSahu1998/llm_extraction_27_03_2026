@@ -211,12 +211,19 @@ def highlight_and_save_pdf(input_document_path, qwen_full_data, ocr_full_data, o
             if res['bbox']:
                 x1, y1 = int(res['bbox'][0][0]), int(res['bbox'][0][1])
                 x2, y2 = int(res['bbox'][2][0]), int(res['bbox'][2][1])
+                # Green bounding box tightly around the VALUE
                 cv2.rectangle(cv_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # The label above it will be the KEY (e.g. 'cpt_codes') in RED text
                 label = f"{res['field']}"
                 (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 yd = max(20, y1)
-                cv2.rectangle(cv_img, (x1, yd - 20), (x1 + w, yd), (0, 255, 0), -1)
-                cv2.putText(cv_img, label, (x1, yd - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                
+                # Draw a clean white background for the label so the red text is easy to read
+                cv2.rectangle(cv_img, (x1, yd - 20), (x1 + w, yd), (255, 255, 255), -1)
+                
+                # Draw the Key text in RED (BGR format is Blue=0, Green=0, Red=255)
+                cv2.putText(cv_img, label, (x1, yd - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
         annotated_pil = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
         annotated_pil_images.append(annotated_pil)
