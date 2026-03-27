@@ -2,6 +2,7 @@ import re
 import cv2
 import json
 import csv
+import difflib
 import numpy as np
 from PIL import Image
 
@@ -27,29 +28,20 @@ def merge_bboxes(bboxes):
     return [[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]]
 
 def filter_spatial_outliers(boxes):
-    """
-    Prevents the 'Giant Bounding Box Bug'.
-    If a field accidentally claims duplicate texts across the page (e.g. three '0's),
-    we calculate the spatial median and drop any box that is wildly far away.
-    """
     if len(boxes) <= 1: return boxes
-    
     centers = [get_center(b['bbox']) for b in boxes]
     median_x = np.median([c[0] for c in centers])
     median_y = np.median([c[1] for c in centers])
-    
     avg_h = np.mean([b['bbox'][2][1] - b['bbox'][0][1] for b in boxes])
     avg_w = np.mean([b['bbox'][2][0] - b['bbox'][0][0] for b in boxes])
     
-    # Allowed radius: ~5 vertical lines tall, ~5 words wide from the center
-    thresh_x = max(avg_w * 5, 200) # strict but fair
+    thresh_x = max(avg_w * 5, 200) 
     thresh_y = max(avg_h * 5, 100) 
     
     filtered = []
     for box, c in zip(boxes, centers):
         if abs(c[0] - median_x) < thresh_x and abs(c[1] - median_y) < thresh_y:
             filtered.append(box)
-            
     return filtered if filtered else boxes
 
 def extract_qwen_items(data, path=""):
@@ -68,46 +60,58 @@ def extract_qwen_items(data, path=""):
             results.append({"field": path, "value": val, "clean": clean_alphanumeric(val), "claimed_boxes": []})
     return results
 
-def is_match(ocr_text, qwen_text):
+def get_match_weight(ocr_text, qwen_text):
     """
-    Robust bi-directional and tokenized matching logic to handle Multi-Word OCR Strings.
+    Returns (True/False, Weight).
+    Higher weight wins! This prevents "30 LYRICA" from stealing "30".
     """
     ocr_clean = clean_alphanumeric(ocr_text)
     q_clean = clean_alphanumeric(qwen_text)
     
-    if not ocr_clean or not q_clean: return False
-    if ocr_clean == q_clean: return True # Exact match
+    if not ocr_clean or not q_clean: return False, 0
+    if ocr_clean == q_clean: return True, 4 # 🏆 EXACT MATCH wins over everything
     
-    # 1. OCR text is a substring of Qwen semantic value
-    if ocr_clean in q_clean and len(ocr_clean) >= 2:
-        return True
-        
-    # 2. Qwen value is a substring of OCR text (Crucial for when PaddleOCR groups an entire table row)
-    if q_clean in ocr_clean and len(q_clean) >= 3:
-        return True
-        
-    # 3. Token-level match (Split the OCR string by spaces, and check if any word matches Qwen)
-    for w in str(ocr_text).split():
+    ocr_words = str(ocr_text).split()
+    for w in ocr_words:
         w_clean = clean_alphanumeric(w)
-        if not w_clean: continue
-        if w_clean == q_clean: return True
-        if len(w_clean) >= 3 and w_clean in q_clean:
-            return True
+        if w_clean and w_clean == q_clean: 
+            return True, 3 # 🏅 EXACT TOKEN MATCH (OCR line contains exact Qwen word)
             
-    return False
+    if ocr_clean in q_clean and len(ocr_clean) >= 2: return True, 2 # Substring 
+    if q_clean in ocr_clean and len(q_clean) >= 3: return True, 2 # Substring
+    
+    for w in ocr_words:
+        w_clean = clean_alphanumeric(w)
+        if w_clean and len(w_clean) >= 3 and w_clean in q_clean:
+            return True, 1
+            
+    # Fuzzy matching for dates/typos (e.g. 08072025 vs 080725)
+    if len(q_clean) >= 5 and len(ocr_clean) >= 4:
+        ratio = difflib.SequenceMatcher(None, ocr_clean, q_clean).ratio()
+        if ratio > 0.75: # ~80% similarity catches date formats perfectly
+            return True, 0.5 
+            
+    return False, 0
 
 def match_single_page(qwen_page_dict, ocr_page_list):
     qwen_items = extract_qwen_items(qwen_page_dict)
     
     for i, box in enumerate(ocr_page_list):
         box['id'] = i
+        box['candidates_raw'] = []
         box['candidates'] = []
         
-    # 2. Find Candidates using new robust bi-directional matching
+    # 2. Find Candidates with weights
     for box in ocr_page_list:
         for q in qwen_items:
-            if is_match(box.get('text', ''), q['value']):
-                box['candidates'].append(q)
+            matched, weight = get_match_weight(box.get('text', ''), q['value'])
+            if matched:
+                box['candidates_raw'].append((q, weight))
+                
+        # ONLY KEEP THE TOP WEIGHT CANDIDATES (Prevents substring "hoovering")
+        if box['candidates_raw']:
+            max_w = max(c[1] for c in box['candidates_raw'])
+            box['candidates'] = [c[0] for c in box['candidates_raw'] if c[1] == max_w]
                 
     # 3. Anchor Unambiguous Boxes
     for box in ocr_page_list:
@@ -121,11 +125,16 @@ def match_single_page(qwen_page_dict, ocr_page_list):
     # 4. Resolve Ambiguous Boxes Spatially
     for box in ocr_page_list:
         if len(box['candidates']) > 1 and box['assigned'] is None:
+            # Hungry Round-Robin: If multiple exact matches exist (e.g. two $2,976.35),
+            # only allow fields that haven't claimed one yet to bid!
+            hungry_candidates = [q for q in box['candidates'] if not q['claimed_boxes']]
+            search_pool = hungry_candidates if hungry_candidates else box['candidates']
+            
             best_q = None
             min_dist = float('inf')
             b_center = get_center(box['bbox'])
             
-            for q in box['candidates']:
+            for q in search_pool:
                 if q['claimed_boxes']:
                     dist = min(((b_center[0] - get_center(ab['bbox'])[0])**2 + (b_center[1] - get_center(ab['bbox'])[1])**2)**0.5 for ab in q['claimed_boxes'])
                     if dist < min_dist:
@@ -133,21 +142,16 @@ def match_single_page(qwen_page_dict, ocr_page_list):
                         best_q = q
             
             if best_q is None:
-                # Absolute fallback only to candidates that haven't claimed boxes yet
-                for q in box['candidates']:
-                    if not q['claimed_boxes']: best_q = q; break
-                if best_q is None: best_q = box['candidates'][0]
+                best_q = search_pool[0]
                     
             best_q['claimed_boxes'].append(box)
             box['assigned'] = best_q
             
-    # 5. Compile Final Bounding Boxes with Outlier Filtering!
+    # 5. Compile Final Bounding Boxes
     final_output = []
     for q in qwen_items:
         if q['claimed_boxes']:
-            # Filter out giant jumps across the page
             sane_boxes = filter_spatial_outliers(q['claimed_boxes'])
-            
             bboxes = [b['bbox'] for b in sane_boxes]
             final_bbox = merge_bboxes(bboxes)
             final_output.append({
@@ -173,11 +177,9 @@ def export_to_csv(all_matched_results, output_csv_path="matched_data.csv"):
                 res['matched_ocr_text'] if res['matched_ocr_text'] else "NO MATCH",
                 str(res['bbox']) if res['bbox'] else "None"
             ])
-    print(f"\n[CSV SAVED] Successfully exported table data to -> {output_csv_path}")
 
 def highlight_and_save_pdf(input_document_path, qwen_full_data, ocr_full_data, output_pdf_path="highlighted_output.pdf"):
     print(f"Loading document: {input_document_path}")
-    
     if input_document_path.lower().endswith(".pdf"):
         pil_images = convert_from_path(input_document_path)
     else:
@@ -186,45 +188,30 @@ def highlight_and_save_pdf(input_document_path, qwen_full_data, ocr_full_data, o
     annotated_pil_images = []
     all_pages_results = []
     
-    print("\n" + "="*50)
-    print("--- RAW PADDLE-OCR OUTPUT ---")
-    for box in ocr_full_data:
-        print(f"OCR Detected: '{box.get('text', '')}' -> (Page {box.get('page','?')})")
-    print("="*50 + "\n")
-    
     for page_index, pil_img in enumerate(pil_images):
         page_num = page_index + 1
         print(f"\n--- Processing Page {page_num} ---")
         
-        qwen_page_dict = qwen_full_data.get(f"page_{page_num}", {})
+        qwen_page_dict = qwen_full_data.get(f"page_{page_num}", qwen_full_data) # Fallback if not paginated
         ocr_page_list = [box for box in ocr_full_data if box.get('page') == page_num]
         
-        if not qwen_page_dict or not ocr_page_list:
-            annotated_pil_images.append(pil_img)
-            continue
+        if not ocr_page_list: ocr_page_list = ocr_full_data 
             
         matched_results = match_single_page(qwen_page_dict, ocr_page_list)
         
         for res in matched_results:
             res['page'] = page_num
             status = "[MATCH]" if res['bbox'] else "[MISS ]"
-            print(f"{status} | Field: {res['field']}")
-            print(f"        Qwen: '{res['qwen_value']}'")
-            print(f"        OCR : '{res['matched_ocr_text']}'")
-            print("-" * 30)
+            print(f"{status} | Field: {res['field']} | Qwen: '{res['qwen_value']}' -> OCR: '{res['matched_ocr_text']}'")
             
         all_pages_results.extend(matched_results)
-        
         cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-        match_count = sum(1 for r in matched_results if r['bbox'])
         
         for res in matched_results:
             if res['bbox']:
                 x1, y1 = int(res['bbox'][0][0]), int(res['bbox'][0][1])
                 x2, y2 = int(res['bbox'][2][0]), int(res['bbox'][2][1])
-                
                 cv2.rectangle(cv_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
                 label = f"{res['field']}"
                 (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 yd = max(20, y1)
@@ -238,9 +225,5 @@ def highlight_and_save_pdf(input_document_path, qwen_full_data, ocr_full_data, o
     export_to_csv(all_pages_results, csv_path)
 
     if annotated_pil_images:
-        annotated_pil_images[0].save(
-            output_pdf_path, 
-            save_all=True, 
-            append_images=annotated_pil_images[1:]
-        )
+        annotated_pil_images[0].save(output_pdf_path, save_all=True, append_images=annotated_pil_images[1:])
         print(f"\n✅ Final visual document written to -> {output_pdf_path}")
